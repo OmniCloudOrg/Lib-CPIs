@@ -1,7 +1,8 @@
 // File: lib_cpi/src/lib.rs
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 use serde_json::Value;
+use std::collections::HashMap;
+pub use lib_cpi_macros as macros;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionParameter {
