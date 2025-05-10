@@ -1,28 +1,103 @@
-// File: lib_cpi_macros/src/lib.rs
 extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::{quote, format_ident};
-use syn::{
-    parse_macro_input, ItemFn, FnArg, Pat, PatIdent, PatType, 
-    Ident, LitStr, ItemStruct, Expr, ExprLit, Lit,
-    Meta, MetaNameValue, Token, parse::Parse, parse::ParseStream,
-    Result, punctuated::Punctuated
-};
-use std::collections::{HashMap, HashSet};
-use lazy_static::lazy_static;
-use std::sync::Mutex;
+use syn::{parse_macro_input, ItemFn, FnArg, Pat, Expr, ExprLit, Lit, parse::Parse, parse::ParseStream, Token};
+use syn::punctuated::Punctuated;
+use syn::{Attribute, Meta, MetaNameValue, Path, Ident};
+use std::collections::HashMap;
 
-// Store registered actions for each extension
-lazy_static! {
-    static ref REGISTERED_ACTIONS: Mutex<HashMap<String, HashSet<String>>> = Mutex::new(HashMap::new());
-    static ref ACTION_INFO: Mutex<HashMap<String, ActionInfo>> = Mutex::new(HashMap::new());
+/// Parameter attribute structure
+struct ParamAttr {
+    name: Option<String>,
+    description: Option<String>,
+    param_type: Option<String>,
+    required: Option<bool>,
+    default_value: Option<String>,
 }
 
-struct ActionInfo {
-    description: String,
-    params: Vec<ParamInfo>,
+impl Parse for ParamAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut attrs = ParamAttr {
+            name: None,
+            description: None,
+            param_type: None,
+            required: None,
+            default_value: None,
+        };
+        
+        let content;
+        syn::parenthesized!(content in input);
+        let pairs = Punctuated::<MetaNameValue, Token![,]>::parse_terminated(&content)?;
+        
+        for pair in pairs {
+            let name_ident = pair.path.get_ident().unwrap().to_string();
+            
+            if let Expr::Lit(ExprLit { lit, .. }) = pair.value {
+                match name_ident.as_str() {
+                    "name" => {
+                        if let Lit::Str(lit_str) = lit {
+                            attrs.name = Some(lit_str.value());
+                        }
+                    },
+                    "description" => {
+                        if let Lit::Str(lit_str) = lit {
+                            attrs.description = Some(lit_str.value());
+                        }
+                    },
+                    "type" => {
+                        if let Lit::Str(lit_str) = lit {
+                            attrs.param_type = Some(lit_str.value());
+                        }
+                    },
+                    "required" => {
+                        if let Lit::Bool(lit_bool) = lit {
+                            attrs.required = Some(lit_bool.value);
+                        }
+                    },
+                    "default" => {
+                        if let Lit::Str(lit_str) = lit {
+                            attrs.default_value = Some(lit_str.value());
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
+        
+        Ok(attrs)
+    }
 }
 
+/// Action attribute structure
+struct ActionAttr {
+    description: Option<String>,
+}
+
+impl Parse for ActionAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut attr = ActionAttr {
+            description: None,
+        };
+        
+        let content;
+        syn::parenthesized!(content in input);
+        let pairs = Punctuated::<MetaNameValue, Token![,]>::parse_terminated(&content)?;
+        
+        for pair in pairs {
+            let name_ident = pair.path.get_ident().unwrap().to_string();
+            
+            if name_ident == "description" {
+                if let Expr::Lit(ExprLit { lit: Lit::Str(lit_str), .. }) = pair.value {
+                    attr.description = Some(lit_str.value());
+                }
+            }
+        }
+        
+        Ok(attr)
+    }
+}
+
+/// Stores parameter metadata during macro processing
 struct ParamInfo {
     name: String,
     description: String,
@@ -31,330 +106,194 @@ struct ParamInfo {
     default_value: Option<String>,
 }
 
-/// Macro to annotate extension action functions
+impl Default for ParamInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            param_type: "String".to_string(),
+            required: true,
+            default_value: None,
+        }
+    }
+}
+
+/// Global storage for action metadata during compilation
+thread_local! {
+    static ACTION_METADATA: std::cell::RefCell<HashMap<String, (String, Vec<ParamInfo>)>> = 
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Macro to annotate extension action functions with metadata
 /// 
-/// Usage: #[action("Description of the action")]
-/// 
-/// This will register the function as an action and generate metadata about its parameters
+/// Usage: #[action(description = "Description of the action")]
 #[proc_macro_attribute]
 pub fn action(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // Parse the input function
     let input = parse_macro_input!(item as ItemFn);
-    let fn_name = &input.sig.ident;
-    let fn_vis = &input.vis;
+    let fn_name = input.sig.ident.to_string();
     
-    // Parse the attribute parameters (description)
-    let attr_str = attr.to_string();
-    let description = if attr_str.is_empty() {
-        format!("Action {}", fn_name)
-    } else {
-        attr_str.trim_matches('"').to_string()
-    };
+    // Parse the action attribute
+    let action_attr = parse_macro_input!(attr as ActionAttr);
+    let description = action_attr.description
+        .unwrap_or_else(|| format!("Action {}", fn_name));
     
-    // Generate the metadata registration function name
-    let meta_fn_name = format_ident!("{}_metadata", fn_name);
-    
-    // Extract parameter names for metadata
-    let mut param_defs = Vec::new();
-    
+    // Extract parameter names for metadata initialization
+    let mut param_names = Vec::new();
     for arg in &input.sig.inputs {
         if let FnArg::Typed(pat_type) = arg {
             if let Pat::Ident(pat_ident) = &*pat_type.pat {
                 let param_name = &pat_ident.ident;
                 
                 // Skip 'self' parameter
-                if param_name == "self" {
+                if param_name == "self" || param_name == "&self" {
                     continue;
                 }
                 
-                let param_name_str = param_name.to_string();
+                param_names.push(param_name.to_string());
+            }
+        }
+    }
+    
+    // Initialize metadata for this function
+    ACTION_METADATA.with(|metadata| {
+        let mut map = metadata.borrow_mut();
+        let params_vec = Vec::new();
+        map.insert(fn_name.clone(), (description, params_vec));
+        
+        // Initialize with empty parameter entries
+        if let Some((_, params)) = map.get_mut(&fn_name) {
+            for name in param_names {
+                let param_info = ParamInfo {
+                    name,
+                    ..Default::default()
+                };
+                params.push(param_info);
+            }
+        }
+    });
+    
+    // Return the function unchanged
+    quote! {
+        #input
+    }.into()
+}
+
+/// Macro to define parameter metadata for actions
+///
+/// Usage: #[param(name = "param_name", description = "Description", type = "String", required = true, default = "value")]
+#[proc_macro_attribute]
+pub fn param(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+    let fn_name = input.sig.ident.to_string();
+    
+    // Parse the parameter metadata
+    let param_attr = parse_macro_input!(attr as ParamAttr);
+    let param_name = param_attr.name.unwrap_or_default();
+    let description = param_attr.description.unwrap_or_default();
+    let param_type = param_attr.param_type.unwrap_or_else(|| "String".to_string());
+    let required = param_attr.required.unwrap_or(true);
+    let default_value = param_attr.default_value;
+    
+    // Update the parameter metadata
+    ACTION_METADATA.with(|metadata| {
+        let mut map = metadata.borrow_mut();
+        if let Some((_, params)) = map.get_mut(&fn_name) {
+            for param in params.iter_mut() {
+                if param.name == param_name {
+                    param.description = description.clone();
+                    param.param_type = param_type.clone();
+                    param.required = required;
+                    param.default_value = default_value.clone();
+                    break;
+                }
+            }
+        }
+    });
+    
+    // Return the function unchanged
+    quote! {
+        #input
+    }.into()
+}
+
+/// Macro to generate the metadata function for an action
+/// This should be called after all param annotations
+#[proc_macro_attribute]
+pub fn generate_metadata(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+    let fn_name = input.sig.ident.to_string();
+    let fn_ident = &input.sig.ident;
+    
+    // Generate metadata function name
+    let meta_fn_name = format_ident!("{}_metadata", fn_name);
+    
+    // Generate the parameter definitions
+    let param_defs = ACTION_METADATA.with(|metadata| {
+        let map = metadata.borrow();
+        let mut defs = Vec::new();
+        
+        if let Some((_, params)) = map.get(&fn_name) {
+            for param in params {
+                let p_name = &param.name;
+                let p_desc = &param.description;
+                let p_type = match param.param_type.as_str() {
+                    "String" => quote! { ParamType::String },
+                    "Integer" => quote! { ParamType::Integer },
+                    "Boolean" => quote! { ParamType::Boolean },
+                    "Object" => quote! { ParamType::Object },
+                    "Array" => quote! { ParamType::Array },
+                    _ => quote! { ParamType::String },
+                };
+                let p_required = param.required;
                 
-                // Create a parameter definition tokens
-                param_defs.push(quote! {
+                let default_value_code = if let Some(default) = &param.default_value {
+                    if param.param_type == "String" {
+                        quote! { Some(json!(#default)) }
+                    } else if param.param_type == "Integer" {
+                        let int_value: i64 = default.parse().unwrap_or(0);
+                        quote! { Some(json!(#int_value)) }
+                    } else if param.param_type == "Boolean" {
+                        let bool_value: bool = default.parse().unwrap_or(false);
+                        quote! { Some(json!(#bool_value)) }
+                    } else {
+                        quote! { None }
+                    }
+                } else {
+                    quote! { None }
+                };
+                
+                defs.push(quote! {
                     ActionParameter {
-                        name: #param_name_str.to_string(),
-                        description: format!("Parameter {}", #param_name_str),
-                        required: true,
-                        param_type: ParamType::String, // Default to string for simplicity
-                        default_value: None,
+                        name: #p_name.to_string(),
+                        description: #p_desc.to_string(),
+                        param_type: #p_type,
+                        required: #p_required,
+                        default_value: #default_value_code,
                     }
                 });
             }
         }
-    }
+        
+        defs
+    });
     
-    // Generate the metadata function
-    let meta_fn = if param_defs.is_empty() {
-        quote! {
-            fn #meta_fn_name() -> ActionDefinition {
-                ActionDefinition {
-                    name: #fn_name.to_string(),
-                    description: #description.to_string(),
-                    parameters: vec![],
-                }
-            }
+    // Get the description
+    let description = ACTION_METADATA.with(|metadata| {
+        let map = metadata.borrow();
+        if let Some((desc, _)) = map.get(&fn_name) {
+            desc.clone()
+        } else {
+            format!("Action {}", fn_name)
         }
-    } else {
-        quote! {
-            fn #meta_fn_name() -> ActionDefinition {
-                ActionDefinition {
-                    name: #fn_name.to_string(),
-                    description: #description.to_string(),
-                    parameters: vec![
-                        #(#param_defs),*
-                    ],
-                }
-            }
-        }
-    };
+    });
     
-    // Generate the expanded output
+    // Final output - function + metadata function
     let result = quote! {
         #input
         
-        #meta_fn
-    };
-    
-    result.into()
-}
-
-/// Parameter definition for a CPI action
-struct ParamDef {
-    name: Ident,
-    description: String,
-    param_type: Ident,
-    required: bool,
-    default_value: Option<Expr>,
-}
-
-impl Parse for ParamDef {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let content;
-        syn::parenthesized!(content in input);
-        let name: Ident = content.parse()?;
-        content.parse::<Token![,]>()?;
-        
-        // Parse description as a string literal
-        let desc_lit: LitStr = content.parse()?;
-        let description = desc_lit.value();
-        content.parse::<Token![,]>()?;
-        
-        // Parse parameter type
-        let param_type: Ident = content.parse()?;
-        content.parse::<Token![,]>()?;
-        
-        // Parse required/optional flag
-        let required_ident: Ident = content.parse()?;
-        let required = required_ident == "required";
-        
-        // Parse default value if present
-        let default_value = if content.peek(Token![,]) {
-            content.parse::<Token![,]>()?;
-            Some(content.parse()?)
-        } else {
-            None
-        };
-        
-        Ok(ParamDef {
-            name,
-            description,
-            param_type,
-            required,
-            default_value,
-        })
-    }
-}
-
-/// CPI Action metadata
-struct CpiActionMeta {
-    description: String,
-    params: Vec<ParamDef>,
-}
-
-impl Parse for CpiActionMeta {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let mut description = String::new();
-        let mut params = Vec::new();
-        
-        // Parse attribute arguments like description = "...", param(...), ...
-        let attrs = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
-        
-        for attr in attrs {
-            match attr {
-                Meta::NameValue(nv) if nv.path.is_ident("description") => {
-                    if let Expr::Lit(expr_lit) = &nv.value {
-                        if let Lit::Str(s) = &expr_lit.lit {
-                            description = s.value();
-                        }
-                    }
-                },
-                Meta::List(list) if list.path.is_ident("param") => {
-                    let param: ParamDef = syn::parse2(list.tokens)?;
-                    params.push(param);
-                },
-                _ => return Err(syn::Error::new_spanned(attr, "Expected 'description' or 'param'")),
-            }
-        }
-        
-        Ok(CpiActionMeta {
-            description,
-            params,
-        })
-    }
-}
-
-/// Extension metadata
-struct CpiExtensionMeta {
-    name: String,
-    provider_type: String,
-}
-
-impl Parse for CpiExtensionMeta {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let mut name = None;
-        let mut provider_type = None;
-        
-        // Parse attribute arguments like name = "...", provider_type = "..."
-        let attrs = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
-        
-        for attr in attrs {
-            match attr {
-                Meta::NameValue(nv) if nv.path.is_ident("name") => {
-                    if let Expr::Lit(expr_lit) = &nv.value {
-                        if let Lit::Str(s) = &expr_lit.lit {
-                            name = Some(s.value());
-                        }
-                    }
-                },
-                Meta::NameValue(nv) if nv.path.is_ident("provider_type") => {
-                    if let Expr::Lit(expr_lit) = &nv.value {
-                        if let Lit::Str(s) = &expr_lit.lit {
-                            provider_type = Some(s.value());
-                        }
-                    }
-                },
-                _ => return Err(syn::Error::new_spanned(attr, "Expected 'name' or 'provider_type'")),
-            }
-        }
-        
-        Ok(CpiExtensionMeta {
-            name: name.unwrap_or_default(),
-            provider_type: provider_type.unwrap_or_else(|| "command".to_string()),
-        })
-    }
-}
-
-/// Macro for defining CPI actions with rich metadata and auto-registration
-/// 
-/// # Example
-/// 
-/// ```
-/// #[cpi_action(
-///     description = "Test if VirtualBox is properly installed"
-/// )]
-/// fn test_install(&self) -> ActionResult {
-///     // Implementation
-/// }
-/// 
-/// #[cpi_action(
-///     description = "Create a new virtual machine",
-///     param(worker_name, "Name of the VM to create", String, required),
-///     param(os_type, "Operating system type", String, optional, "Ubuntu_64"),
-///     param(memory_mb, "Memory in MB", Integer, optional, 2048),
-///     param(cpu_count, "Number of CPUs", Integer, optional, 2)
-/// )]
-/// fn create_worker(&self, worker_name: String, os_type: String, memory_mb: i64, cpu_count: i64) -> ActionResult {
-///     // Implementation
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn cpi_action(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input_fn = parse_macro_input!(item as ItemFn);
-    let meta = parse_macro_input!(attr as CpiActionMeta);
-    
-    let fn_name = &input_fn.sig.ident;
-    let fn_name_str = fn_name.to_string();
-    let vis = &input_fn.vis;
-    let attrs = &input_fn.attrs;
-    let block = &input_fn.block;
-    let output = &input_fn.sig.output;
-    
-    // Extract the description to use in quote macro
-    let description = meta.description.clone();
-    
-    // Generate parameters for function definition
-    let params = &input_fn.sig.inputs;
-    
-    // Register this action for later trait implementation
-    let mut action_info = ActionInfo {
-        description: description.clone(),
-        params: Vec::new(),
-    };
-    
-    for param in &meta.params {
-        let param_info = ParamInfo {
-            name: param.name.to_string(),
-            description: param.description.clone(),
-            param_type: param.param_type.to_string(),
-            required: param.required,
-            default_value: param.default_value.as_ref().map(|_| "default".to_string()), // Just a placeholder
-        };
-        action_info.params.push(param_info);
-    }
-    
-    // Store action info in the global registry
-    let mut action_info_map = ACTION_INFO.lock().unwrap();
-    action_info_map.insert(fn_name_str.clone(), action_info);
-    
-    // Generate param names for registration
-    let param_names = meta.params.iter().map(|p| &p.name).collect::<Vec<_>>();
-    let param_descriptions = meta.params.iter().map(|p| &p.description).collect::<Vec<_>>();
-    let param_types = meta.params.iter().map(|p| &p.param_type).collect::<Vec<_>>();
-    let param_requireds = meta.params.iter().map(|p| p.required).collect::<Vec<_>>();
-    let param_defaults = meta.params.iter().map(|p| p.default_value.as_ref()).collect::<Vec<_>>();
-    
-    // Generate the metadata registration function name
-    let meta_fn_name = format_ident!("{}_metadata", fn_name);
-    
-    // Create parameter definitions for the metadata function
-    let mut param_defs = Vec::new();
-    
-    for (i, param) in meta.params.iter().enumerate() {
-        let name = &param.name;
-        let name_str = name.to_string();
-        let description = &param.description;
-        let param_type = &param.param_type;
-        let required = param.required;
-        
-        let param_def = if let Some(default_val) = &param.default_value {
-            quote! {
-                param!(
-                    #name_str, 
-                    #description, 
-                    ParamType::#param_type, 
-                    if #required { required } else { optional },
-                    #default_val
-                )
-            }
-        } else {
-            quote! {
-                param!(
-                    #name_str, 
-                    #description, 
-                    ParamType::#param_type, 
-                    if #required { required } else { optional }
-                )
-            }
-        };
-        
-        param_defs.push(param_def);
-    }
-    
-    // Generate the metadata function
-    let meta_fn = quote! {
         fn #meta_fn_name() -> ActionDefinition {
             ActionDefinition {
-                name: #fn_name_str.to_string(),
+                name: #fn_name.to_string(),
                 description: #description.to_string(),
                 parameters: vec![
                     #(#param_defs),*
@@ -363,134 +302,54 @@ pub fn cpi_action(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     
-    // Add action attribute to the function and register its metadata
-    let result = quote! {
-        #(#attrs)*
-        #[action]
-        #vis fn #fn_name(#params) #output #block
-        
-        #meta_fn
-        
-        // Register this action with the current extension
-        // This is a compile-time only marker that will be collected by cpi_extension
-        #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
-        static __register_ #fn_name: () = {
-            extern "C" {
-                #[no_mangle]
-                static __CPI_EXTENSION_ACTIONS: &[&str];
-            }
-            // This doesn't actually do anything at runtime, it's just a marker
-            ()
-        };
-    };
-    
     result.into()
 }
 
-/// Macro for implementing CPI extension with automatic trait implementation
-/// 
-/// # Example
-/// 
-/// ```
-/// #[cpi_extension(
-///     name = "virtualbox",
-///     provider_type = "command"
-/// )]
-/// pub struct VirtualBoxExtension {
-///     default_settings: HashMap<String, Value>,
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn cpi_extension(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input_struct = parse_macro_input!(item as ItemStruct);
-    let meta = parse_macro_input!(attr as CpiExtensionMeta);
+/// Macro to register action functions with the CpiExtension trait
+///
+/// Usage: register_actions![action1, action2, ...]
+#[proc_macro]
+pub fn register_actions(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let action_names: Vec<String> = input_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     
-    let struct_name = &input_struct.ident;
-    let struct_name_str = struct_name.to_string();
-    let name = &meta.name;
-    let provider_type = &meta.provider_type;
+    let action_strings = action_names.iter().map(|s| s.as_str());
+    let action_meta_fns = action_names.iter().map(|name| format_ident!("{}_metadata", name));
     
-    // Generate the trait implementation
-    // Since we don't have a statically available list of actions at this point,
-    // we need to resort to using a runtime approach.
-    let result = quote! {
-        // Define the original struct
-        #input_struct
-        
-        // Create a static registry for action metadata
-        lazy_static::lazy_static! {
-            static ref ACTION_REGISTRY: std::sync::RwLock<std::collections::HashMap<String, ActionDefinition>> = {
-                let mut registry = std::collections::HashMap::new();
-                
-                // We'll scan for all *_metadata functions at runtime
-                
-                std::sync::RwLock::new(registry)
-            };
+    let list_actions_impl = quote! {
+        fn list_actions(&self) -> Vec<String> {
+            vec![
+                #(#action_strings.to_string()),*
+            ]
         }
-        
-        // Create a runtime registry initialization function
-        fn initialize_action_registry() {
-            let mut registry = ACTION_REGISTRY.write().unwrap();
-            
-            // Only initialize once
-            if !registry.is_empty() {
-                return;
-            }
-            
-            // Find all available metadata functions using reflection
-            let type_id = std::any::TypeId::of::<#struct_name>();
-            
-            // These will be filled in by the cpi_action macros
-            registry.insert("test_install".to_string(), test_install_metadata());
-            // Add more actions here based on what's defined in the struct
+    };
+    
+    let get_action_def_match_arms = action_names.iter().zip(action_meta_fns).map(|(name, meta_fn)| {
+        quote! {
+            #name => Some(#meta_fn()),
         }
-        
-        // Implement CpiExtension trait
-        impl CpiExtension for #struct_name {
-            fn name(&self) -> &str {
-                #name
-            }
-            
-            fn provider_type(&self) -> &str {
-                #provider_type
-            }
-            
-            fn list_actions(&self) -> Vec<String> {
-                // Initialize registry if needed
-                initialize_action_registry();
-                
-                // Return the keys from the registry
-                ACTION_REGISTRY.read().unwrap().keys().cloned().collect()
-            }
-            
-            fn get_action_definition(&self, action: &str) -> Option<ActionDefinition> {
-                // Initialize registry if needed
-                initialize_action_registry();
-                
-                // Look up the action in the registry
-                ACTION_REGISTRY.read().unwrap().get(action).cloned()
-            }
-            
-            fn execute_action(&self, action: &str, params: &std::collections::HashMap<String, serde_json::Value>) -> ActionResult {
-                match action {
-                    "test_install" => self.test_install(),
-                    "list_workers" => self.list_workers(),
-                    "create_worker" => {
-                        let worker_name = validation::extract_string(params, "worker_name")?;
-                        let os_type = validation::extract_string_opt(params, "os_type")?.unwrap_or_else(|| "Ubuntu_64".to_string());
-                        let memory_mb = validation::extract_int_opt(params, "memory_mb")?.unwrap_or(2048);
-                        let cpu_count = validation::extract_int_opt(params, "cpu_count")?.unwrap_or(2);
-                        
-                        self.create_worker(worker_name, os_type, memory_mb, cpu_count)
-                    },
-                    // Other actions with parameters manually extracted
-                    // This is a limitation of our current implementation
-                    _ => Err(format!("Action '{}' not found", action)),
-                }
+    });
+    
+    let get_action_def_impl = quote! {
+        fn get_action_definition(&self, action: &str) -> Option<ActionDefinition> {
+            match action {
+                #(#get_action_def_match_arms)*
+                _ => None,
             }
         }
     };
     
-    result.into()
+    let final_code = quote! {
+        #list_actions_impl
+        
+        #get_action_def_impl
+        
+        // NOTE: The execute_action method needs to be implemented manually
+    };
+    
+    final_code.into()
 }
