@@ -116,7 +116,7 @@ impl CpiExtension for MockExtension {
                 description: "Test action with string and integer parameters".to_string(),
                 parameters: vec![
                     param!("name", "Name parameter", ParamType::String, required),
-                    param!("count", "Count parameter", ParamType::Integer, required),
+                    param!("count", "Count parameter", ParamType::Number, required),
                 ],
             }),
             "test_complex_return" => Some(ActionDefinition {

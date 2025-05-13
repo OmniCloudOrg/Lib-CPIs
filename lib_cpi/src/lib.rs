@@ -1,8 +1,7 @@
 // File: lib_cpi/src/lib.rs
-use serde_json::Value;
 use std::collections::HashMap;
-pub use lib_cpi_macros as macros;
 use serde::{Serialize, Deserialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionParameter {
@@ -16,10 +15,10 @@ pub struct ActionParameter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ParamType {
     String,
-    Integer,
-    Float,
+    Number,
     Boolean,
-    Json,
+    Object,
+    Array,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +56,11 @@ pub trait CpiExtension: Send + Sync {
     fn test_install(&self) -> ActionResult {
         // Default implementation returns success
         Ok(serde_json::json!({"status": "ok"}))
+    }
+
+    fn version(&self) -> String {
+        // Default implementation returns a placeholder version
+        "NONE".to_string()
     }
 }
 
